@@ -1,0 +1,43 @@
+# whw-neo4j: dedicated audit graph. Bolt :7691 / HTTP :7475 to avoid clashing with
+# codegarden (:7687) and autoresearch (:7688) already running on this host.
+#
+#   docker compose up -d whw-neo4j
+#   # then apply the schema:
+#   cypher-shell -a bolt://localhost:7691 -u neo4j -p whw-dev-password -f whw/neo4j_schema.cypher
+#
+# Requires Neo4j >= 5.13 for native vector indexes (Nomic 768-dim, cosine).
+
+services:
+  whw-neo4j:
+    image: neo4j:5.21-community
+    container_name: whw-neo4j
+    restart: unless-stopped
+    ports:
+      # HTTP browser intentionally NOT exposed by default (host has 7474-7476 already
+      # bound by other Neo4j instances). Uncomment + pick a free high port if needed:
+      # - "17474:7474"
+      - "7691:7687"   # Bolt — the only port we need for the audit MCP & ingest.
+    environment:
+      NEO4J_AUTH: neo4j/whw-dev-password
+      NEO4J_dbms_memory_heap_initial__size: 1G
+      NEO4J_dbms_memory_heap_max__size: 2G
+      NEO4J_dbms_memory_pagecache_size: 1G
+      # APOC optional (we use only built-in vector index calls; uncomment if needed).
+      # NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - whw_neo4j_data:/data
+      - whw_neo4j_logs:/logs
+      - whw_neo4j_import:/var/lib/neo4j/import
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "cypher-shell -u neo4j -p whw-dev-password 'RETURN 1' >/dev/null"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  whw_neo4j_data:
+  whw_neo4j_logs:
+  whw_neo4j_import:

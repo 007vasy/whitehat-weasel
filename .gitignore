@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CyberGym data (large local dataset, not tracked)
+cybergym_data/
+
+# WHW run state
+.whw/
