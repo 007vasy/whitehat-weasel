@@ -100,6 +100,23 @@ def test_resolve_scope_all_returns_every_function(arvo_1065_ingested, neo4j_driv
     assert len(fns) >= 200
 
 
+def test_resolve_scope_file_glob_basename_fallback_for_cybergym_paths(
+    arvo_1065_ingested, neo4j_driver,
+):
+    """CyberGym L3 patch paths are project-relative (e.g. 'src/funcs.c') while ingested
+    file_paths include the src-vul prefix ('file/src/funcs.c'). The exact glob misses,
+    but the basename fallback in resolve_scope still finds the file. Used by
+    `whw eval suite` to auto-scope from the patch path."""
+    # Literal 'src/funcs.c' would regex-anchor to '^src/funcs\\.c$' and match nothing.
+    fns = resolve_scope(neo4j_driver, "arvo-1065", "vul",
+                        ScopeSpec(file_glob="src/funcs.c"))
+    # Fallback by trailing '/funcs.c' matches the file/src/funcs.c functions.
+    assert len(fns) >= 15
+    names = {f["name"] for f in fns}
+    assert "file_regexec" in names
+    assert {f["fp"] for f in fns} == {"file/src/funcs.c"}
+
+
 def test_resolve_scope_empty_raises(arvo_1065_ingested, neo4j_driver):
     with pytest.raises(ValueError):
         resolve_scope(neo4j_driver, "arvo-1065", "vul", ScopeSpec())
