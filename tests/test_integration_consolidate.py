@@ -70,6 +70,36 @@ def _ensure_audit_run(driver, run_id: str, eval_ts: str | None = None) -> None:
         """, rid=run_id, eval_ts=eval_ts)
 
 
+def _inject_finding_with_loc(
+    driver, run_id: str, embedding: list[float], *,
+    summary: str = "x", function_qn: str | None = None,
+    file_path: str | None = None,
+    line_start: int | None = None, line_end: int | None = None,
+    status: str = "open", observed_at: str | None = None,
+) -> str:
+    """Inject a Finding with explicit location fields (for dedup location-constraint tests)."""
+    s = get_settings()
+    fid = str(uuid.uuid4())
+    with driver.session(database=s.neo4j_database) as session:
+        session.run("""
+            MATCH (run:AuditRun {id:$rid})
+            CREATE (n:Finding {
+                id: $id, vuln_class: 'TEST', severity: 'med', confidence: 'inferred',
+                summary: $summary, rationale: 'r', source: 'test',
+                tool_evidence: '', created_at: datetime(),
+                commit_observed_at: CASE WHEN $obs IS NULL THEN datetime() ELSE datetime($obs) END,
+                audit_run_id: $rid, status: $status, model_used: 'test',
+                repo_id: run.repo_id, commit: run.commit,
+                embedding: $emb,
+                function_qn: $fn, file_path: $fp,
+                line_start: $ls, line_end: $le
+            })
+            MERGE (run)-[:FOUND]->(n)
+        """, rid=run_id, id=fid, summary=summary, status=status, obs=observed_at,
+            emb=embedding, fn=function_qn, fp=file_path, ls=line_start, le=line_end)
+    return fid
+
+
 def _inject_finding(driver, run_id: str, embedding: list[float], *,
                     summary: str = "synthetic finding", status: str = "open",
                     observed_at: str | None = None) -> str:
@@ -240,6 +270,110 @@ def test_dedup_marks_newer_as_duplicate_of_older(neo4j_driver, fresh_run):
     assert row["dedup_of"] == canonical_id
     assert row["can_status"] == "open"
     assert row["cosine"] >= 0.92
+
+
+def test_dedup_location_constraint_keeps_different_functions_distinct(neo4j_driver, fresh_run):
+    """Two findings with EQUAL embeddings but DIFFERENT function_qn (different lines too)
+    must NOT be merged. This guards against the failure mode observed on arvo-1065 where
+    the dedup pass collapsed distinct bugs in file_regexec and file_replace just because
+    their UNINIT_MEMORY summaries were cosine-similar."""
+    s = get_settings()
+    base = _unit_vec(99)
+    fid_a = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="bug in foo", function_qn="pkg.foo",
+        file_path="src/x.c", line_start=10, line_end=20,
+        observed_at="2024-01-01T00:00:00Z",
+    )
+    fid_b = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="similarly-worded bug in bar", function_qn="pkg.bar",
+        file_path="src/x.c", line_start=200, line_end=210,
+        observed_at="2024-06-01T00:00:00Z",
+    )
+
+    result = consolidate(fresh_run["run_id"], driver=neo4j_driver,
+                         skip_fp_suppress=True, skip_asset_link=True)
+    assert result.n_duplicates == 0, (
+        "different functions in same file at non-overlapping lines must not merge"
+    )
+    with neo4j_driver.session(database=s.neo4j_database) as session:
+        statuses = sorted([
+            session.run("MATCH (n:Finding {id:$id}) RETURN n.status AS s", id=fid).single()["s"]
+            for fid in (fid_a, fid_b)
+        ])
+    assert statuses == ["open", "open"]
+
+
+def test_dedup_location_constraint_merges_same_function(neo4j_driver, fresh_run):
+    """Two findings at the SAME function_qn with similar embeddings DO merge."""
+    base = _unit_vec(100)
+    fid_canon = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="canonical wording", function_qn="pkg.foo",
+        file_path="src/x.c", line_start=10, line_end=20,
+        observed_at="2024-01-01T00:00:00Z",
+    )
+    fid_dup = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="alternate wording", function_qn="pkg.foo",
+        file_path="src/x.c", line_start=15, line_end=18,
+        observed_at="2024-06-01T00:00:00Z",
+    )
+    result = consolidate(fresh_run["run_id"], driver=neo4j_driver,
+                         skip_fp_suppress=True, skip_asset_link=True)
+    assert result.n_duplicates == 1
+    s = get_settings()
+    with neo4j_driver.session(database=s.neo4j_database) as session:
+        statuses = {
+            fid: session.run("MATCH (n:Finding {id:$id}) RETURN n.status AS s", id=fid).single()["s"]
+            for fid in (fid_canon, fid_dup)
+        }
+    assert statuses == {fid_canon: "open", fid_dup: "duplicate"}
+
+
+def test_dedup_location_constraint_merges_overlapping_line_ranges_same_file(
+    neo4j_driver, fresh_run,
+):
+    """Two findings in the SAME FILE at OVERLAPPING line ranges (even if function_qn
+    differs — e.g. helper functions inside the same code segment) DO merge."""
+    base = _unit_vec(101)
+    fid_canon = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="x", function_qn=None,
+        file_path="src/x.c", line_start=100, line_end=120,
+        observed_at="2024-01-01T00:00:00Z",
+    )
+    fid_dup = _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="x", function_qn=None,
+        file_path="src/x.c", line_start=115, line_end=130,  # overlaps 100-120
+        observed_at="2024-06-01T00:00:00Z",
+    )
+    result = consolidate(fresh_run["run_id"], driver=neo4j_driver,
+                         skip_fp_suppress=True, skip_asset_link=True)
+    assert result.n_duplicates == 1
+
+
+def test_dedup_location_constraint_locationless_infra_findings_merge(neo4j_driver, fresh_run):
+    """Two infra-style Findings (no function_qn, no file_path) with similar embeddings
+    DO merge — they have no location to discriminate on, so pure semantic dedup applies."""
+    base = _unit_vec(102)
+    _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="infra A", function_qn=None, file_path=None,
+        line_start=None, line_end=None,
+        observed_at="2024-01-01T00:00:00Z",
+    )
+    _inject_finding_with_loc(
+        neo4j_driver, fresh_run["run_id"], base,
+        summary="infra B", function_qn=None, file_path=None,
+        line_start=None, line_end=None,
+        observed_at="2024-06-01T00:00:00Z",
+    )
+    result = consolidate(fresh_run["run_id"], driver=neo4j_driver,
+                         skip_fp_suppress=True, skip_asset_link=True)
+    assert result.n_duplicates == 1
 
 
 def test_dedup_below_threshold_keeps_both_open(neo4j_driver, fresh_run):

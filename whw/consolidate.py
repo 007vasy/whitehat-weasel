@@ -146,7 +146,16 @@ def _pass_fp_suppress(driver: Driver, audit_run_id: str, threshold: float) -> in
 # ---------- pass 3: dedup via vector index -----------------------------------
 
 def _pass_dedup(driver: Driver, audit_run_id: str, threshold: float) -> int:
-    """Mark open Findings as :DUPLICATE_OF an older canonical when cosine >= threshold.
+    """Mark open Findings as :DUPLICATE_OF an older canonical when cosine >= threshold
+    AND the two share a code location.
+
+    Location constraint (added after observing the dedup pass merge distinct bugs
+    that just happened to be cosine-similar): two Findings may only be merged if
+      (a) they have the same function_qn, OR
+      (b) they have the same file_path AND their line ranges overlap, OR
+      (c) they are both location-less (function_qn IS NULL AND file_path IS NULL —
+          the infra-pass case where pure semantic dedup is appropriate).
+    Otherwise, semantically-related findings in DIFFERENT functions stay distinct.
 
     Iterates NEWEST-first. Each newer Finding looks for an older open canonical and
     marks itself the duplicate. By the time the loop reaches older Findings, their
@@ -160,19 +169,32 @@ def _pass_dedup(driver: Driver, audit_run_id: str, threshold: float) -> int:
             MATCH (run:AuditRun {id:$rid})-[:FOUND]->(n:Finding {status:'open'})
             WHERE n.embedding IS NOT NULL
               AND any(x IN n.embedding WHERE x <> 0.0)
-            RETURN n.id AS id, n.embedding AS emb, n.created_at AS created_at
+            RETURN n.id AS id, n.embedding AS emb, n.created_at AS created_at,
+                   n.function_qn AS fn, n.file_path AS fp,
+                   n.line_start AS ls, n.line_end AS le
             ORDER BY n.created_at DESC, n.id DESC
         """, rid=audit_run_id))
 
         for row in candidates:
+            # Top-k bumped from 6 → 12 since the location filter rules many out;
+            # we want enough survivors to find the best location-matched candidate.
             best = session.run("""
-                CALL db.index.vector.queryNodes('finding_embedding', 6, $emb) YIELD node AS m, score
+                CALL db.index.vector.queryNodes('finding_embedding', 12, $emb)
+                YIELD node AS m, score
                 WHERE m.id <> $nid
                   AND score >= $threshold
                   AND m.status IN ['open', 'verified']
+                  AND (
+                    ($fn IS NOT NULL AND m.function_qn = $fn)
+                    OR ($fp IS NOT NULL AND m.file_path = $fp
+                        AND m.line_start <= $le AND $ls <= m.line_end)
+                    OR ($fn IS NULL AND $fp IS NULL
+                        AND m.function_qn IS NULL AND m.file_path IS NULL)
+                  )
                 WITH m, score ORDER BY score DESC, m.created_at ASC LIMIT 1
                 RETURN m.id AS canonical_id, score AS cosine
-            """, emb=row["emb"], nid=row["id"], threshold=threshold).single()
+            """, emb=row["emb"], nid=row["id"], threshold=threshold,
+                 fn=row["fn"], fp=row["fp"], ls=row["ls"], le=row["le"]).single()
             if not best:
                 continue
             session.run("""

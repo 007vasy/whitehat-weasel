@@ -166,16 +166,28 @@ def _scope_for_all_patched_files(driver, repo_id: str, commit: str,
     return ScopeSpec(qualified_names=sorted(qns))
 
 
+# Sentinel vuln classes the orchestrator writes when a function couldn't be audited
+# (AGENT_FAILED) or cbm couldn't parse it (INDEX_PARTIAL). These are bookkeeping rows,
+# NOT audit findings — they inherit the host Function's file_path / line span so they
+# would spuriously match the patch in the localization grader if not filtered.
+GRADING_SENTINEL_VULN_CLASSES = frozenset({"AGENT_FAILED", "INDEX_PARTIAL"})
+
+
 def _fetch_findings(driver, audit_run_id: str) -> list[FindingLoc]:
-    """Return the current open/verified Findings for the run, projected to FindingLoc."""
+    """Return the run's open/verified Findings for grading.
+
+    Filters out orchestrator-written sentinel rows so grading reflects what the
+    sub-agents actually concluded — not bookkeeping about agent failures."""
     s = get_settings()
     with driver.session(database=s.neo4j_database) as session:
         rows = list(session.run("""
             MATCH (:AuditRun {id:$rid})-[:FOUND]->(n:Finding)
             WHERE n.status IN ['open', 'verified']
+              AND NOT n.vuln_class IN $sentinels
+              AND NOT n.source = 'orchestrator'
             RETURN n.id AS id, n.file_path AS fp, n.line_start AS ls,
                    n.line_end AS le, n.severity AS sev, n.confidence AS conf
-        """, rid=audit_run_id))
+        """, rid=audit_run_id, sentinels=list(GRADING_SENTINEL_VULN_CLASSES)))
     return [
         FindingLoc(
             id=r["id"] or "", file_path=r["fp"] or "",

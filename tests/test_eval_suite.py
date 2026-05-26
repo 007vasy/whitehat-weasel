@@ -91,6 +91,40 @@ def test_aggregate_all_errors_yields_zeros():
     assert agg.macro_iou_line == 0.0
 
 
+def test_fetch_findings_filters_sentinel_rows(monkeypatch):
+    """`_fetch_findings` must exclude AGENT_FAILED / INDEX_PARTIAL / source='orchestrator'
+    sentinels — they inherit the host Function's span so they'd spuriously hit the
+    patch hunks under line-overlap grading."""
+    from whw.eval.suite import _fetch_findings, GRADING_SENTINEL_VULN_CLASSES
+
+    # The function builds a Cypher session and runs one query. We replace the driver
+    # with a minimal stub that captures the query parameters; the actual filter has
+    # to be in the Cypher.
+    captured: dict = {}
+
+    class _Session:
+        def __init__(self):
+            pass
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def run(self, query, **params):
+            captured["query"] = query
+            captured["params"] = params
+            return iter([])
+
+    class _Driver:
+        def session(self, **kw): return _Session()
+
+    findings = _fetch_findings(_Driver(), "run-x")
+    assert findings == []
+    q = captured["query"]
+    assert "WHERE n.status IN ['open', 'verified']" in q
+    # The Cypher MUST reference both the sentinel-class filter AND the source filter.
+    assert "NOT n.vuln_class IN $sentinels" in q
+    assert "NOT n.source = 'orchestrator'" in q
+    assert set(captured["params"]["sentinels"]) == set(GRADING_SENTINEL_VULN_CLASSES)
+
+
 def test_scope_for_all_patched_files_unions_qns_across_files(monkeypatch):
     """_scope_for_all_patched_files calls resolve_scope per distinct patched file and
     unions the QNs. Test the union math without touching Neo4j by stubbing resolve_scope."""

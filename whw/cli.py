@@ -294,8 +294,14 @@ def eval_localize(sample: str, audit_run: str, data_root: str, out: str | None) 
     driver = GraphDatabase.driver(s.neo4j_uri, auth=s.neo4j_auth)
     try:
         with driver.session(database=s.neo4j_database) as session:
+            # Match the suite grader exactly: open/verified only (skip duplicates,
+            # suppressed, FPs) and skip orchestrator-written sentinels. This makes
+            # `whw eval localize` consistent with `whw eval suite`.
             rows = list(session.run("""
                 MATCH (run:AuditRun {id:$rid})-[:FOUND]->(n:Finding)
+                WHERE n.status IN ['open', 'verified']
+                  AND NOT n.vuln_class IN ['AGENT_FAILED', 'INDEX_PARTIAL']
+                  AND NOT n.source = 'orchestrator'
                 RETURN n.id AS id, n.file_path AS fp, n.line_start AS ls,
                        n.line_end AS le, n.severity AS sev, n.confidence AS conf
             """, rid=audit_run))
