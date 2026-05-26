@@ -532,8 +532,15 @@ def build_task_message(*, run_id: str, repo_id: str, commit: str, mode: str,
                        file_path: str, line_start: int, line_end: int,
                        callgraph_text: str, source_slice: str,
                        tools_image: str | None,
+                       abs_repo_root: str | None,
                        user_context_excerpt: str | None) -> str:
-    """Serialize the per-function task into a single string passed as the user message."""
+    """Serialize the per-function task into a single string passed as the user message.
+
+    When `tools_image` is supplied, includes a "STATIC ANALYSIS TOOLS" section that
+    shows the agent the exact `docker run` invocation pattern (image name + the host
+    mount path resolved from RepoCommit.abs_repo_root). Without that block, the
+    system prompt's Bash hint is too abstract for the agent to act on.
+    """
     parts = [
         f"audit_run_id: {run_id}",
         f"repo_id: {repo_id}",
@@ -542,8 +549,6 @@ def build_task_message(*, run_id: str, repo_id: str, commit: str, mode: str,
     ]
     if eval_commit_ts:
         parts.append(f"eval_commit_ts: {eval_commit_ts}")
-    if tools_image:
-        parts.append(f"tools_image: {tools_image}")
     parts.append("")
     parts.append(f"TARGET FUNCTION: {name}  (qualified_name: {function_qn})")
     parts.append(f"LOCATION: {file_path}:{line_start}-{line_end}")
@@ -555,6 +560,21 @@ def build_task_message(*, run_id: str, repo_id: str, commit: str, mode: str,
     parts.append("```c")
     parts.append(source_slice or "(unavailable)")
     parts.append("```")
+    if tools_image and abs_repo_root:
+        parts.append("")
+        parts.append("STATIC ANALYSIS TOOLS — Docker image is available:")
+        parts.append(f"  image:       {tools_image}")
+        parts.append(f"  mount path:  {abs_repo_root}  (mount read-only as /src)")
+        parts.append("  example invocation (Bash is allowed for `docker run` against this image):")
+        parts.append(f"    docker run --rm -v {abs_repo_root}:/src:ro {tools_image} \\")
+        parts.append(f"      <tool> /src/{file_path}")
+        parts.append("  Run the language's statics (e.g. clang-static-analyzer, cppcheck,")
+        parts.append("  semgrep) to corroborate findings. Paste any non-trivial output")
+        parts.append("  into the add_finding `tool_evidence` field.")
+    elif tools_image and not abs_repo_root:
+        parts.append("")
+        parts.append(f"tools_image was set ({tools_image}) but the host mount path is unknown — "
+                     "skip docker invocations and rely on source-only analysis.")
     if user_context_excerpt:
         parts.append("")
         parts.append("USER CONTEXT (excerpt):")
@@ -685,7 +705,8 @@ def _spawn_subagent_attempt(
         eval_commit_ts=eval_commit_ts, function_qn=qn, name=function["name"] or qn,
         file_path=function["fp"], line_start=function["ls"], line_end=function["le"],
         callgraph_text=callgraph_text, source_slice=source_slice,
-        tools_image=tools_image, user_context_excerpt=user_context_excerpt,
+        tools_image=tools_image, abs_repo_root=str(abs_repo_root) if abs_repo_root else None,
+        user_context_excerpt=user_context_excerpt,
     )
 
     system_prompt = system_prompt_path.read_text(encoding="utf-8")
