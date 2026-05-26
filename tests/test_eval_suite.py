@@ -91,6 +91,44 @@ def test_aggregate_all_errors_yields_zeros():
     assert agg.macro_iou_line == 0.0
 
 
+def test_scope_for_all_patched_files_unions_qns_across_files(monkeypatch):
+    """_scope_for_all_patched_files calls resolve_scope per distinct patched file and
+    unions the QNs. Test the union math without touching Neo4j by stubbing resolve_scope."""
+    from unittest.mock import MagicMock
+
+    from whw.eval.cybergym_loader import CyberGymSample, PatchHunk
+    from whw.eval.suite import _scope_for_all_patched_files
+    import whw.eval.suite as suite_mod
+
+    # Three hunks across two distinct files.
+    cg = CyberGymSample(
+        sample_id="x", base_dir=None, l2_dir=None, l3_dir=None,
+        description="", src_vul_dir=None,
+        patch_hunks=[
+            PatchHunk(file_path="src/a.c", line_start=10, line_end=12),
+            PatchHunk(file_path="src/a.c", line_start=50, line_end=51),
+            PatchHunk(file_path="src/b.c", line_start=1, line_end=1),
+        ],
+    )
+
+    calls: list[str] = []
+
+    def fake_resolve_scope(driver, repo_id, commit, scope):
+        calls.append(scope.file_glob)
+        if scope.file_glob == "src/a.c":
+            return [{"qn": "a.foo"}, {"qn": "a.bar"}]
+        if scope.file_glob == "src/b.c":
+            return [{"qn": "b.baz"}]
+        return []
+
+    monkeypatch.setattr(suite_mod, "resolve_scope", fake_resolve_scope)
+
+    spec = _scope_for_all_patched_files(MagicMock(), "x", "vul", cg)
+    # One resolve_scope call per distinct file (a.c appears twice → still 1 call).
+    assert sorted(calls) == ["src/a.c", "src/b.c"]
+    assert spec.qualified_names == ["a.bar", "a.foo", "b.baz"]
+
+
 def test_suite_report_to_dict_serializable():
     """End-to-end: SuiteReport.to_dict round-trips through JSON without errors."""
     import json

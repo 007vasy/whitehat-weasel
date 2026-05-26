@@ -82,9 +82,12 @@ class ScopeSpec:
     """Declarative description of what to audit. Exactly one strategy field should be set."""
     entrypoint: str | None = None           # QN or "<file_basename>:<symbol>" shorthand
     entrypoint_depth: int = 3
-    file_glob: str | None = None            # SQL LIKE pattern (use % wildcards)
+    file_glob: str | None = None            # shell glob, basename-fallback if literal misses
     function: str | None = None             # exact Function.name
     all: bool = False
+    qualified_names: list[str] | None = None  # explicit QN list (used by eval suite for
+                                              # multi-file patches: gather QNs across all
+                                              # patched files, scope as a single set)
 
     def describe(self) -> str:
         if self.entrypoint:
@@ -93,6 +96,8 @@ class ScopeSpec:
             return f"file_glob={self.file_glob}"
         if self.function:
             return f"function={self.function}"
+        if self.qualified_names is not None:
+            return f"qualified_names×{len(self.qualified_names)}"
         if self.all:
             return "all"
         return "(empty)"
@@ -218,7 +223,19 @@ def resolve_scope(driver: Driver, repo_id: str, commit: str, spec: ScopeSpec) ->
         if spec.entrypoint:
             return _resolve_entrypoint_scope(session, repo_id, commit, spec)
 
-    raise ValueError("ScopeSpec is empty — set exactly one of entrypoint/file_glob/function/all.")
+        if spec.qualified_names is not None:
+            if not spec.qualified_names:
+                return []
+            rows = session.run("""
+                MATCH (f:Function {repo_id:$repo_id, commit:$commit})
+                WHERE f.qualified_name IN $qns
+                RETURN f.qualified_name AS qn, f.name AS name, f.file_path AS fp,
+                       f.line_start AS ls, f.line_end AS le
+                ORDER BY f.file_path, f.line_start
+            """, repo_id=repo_id, commit=commit, qns=spec.qualified_names)
+            return [dict(r) for r in rows]
+
+    raise ValueError("ScopeSpec is empty — set exactly one of entrypoint/file_glob/function/all/qualified_names.")
 
 
 def _resolve_entrypoint_scope(session, repo_id: str, commit: str, spec: ScopeSpec) -> list[dict]:
@@ -551,6 +568,9 @@ def build_task_message(*, run_id: str, repo_id: str, commit: str, mode: str,
 # ---------- shared claude -p plumbing (audit + triage + infra agents) -------
 
 # Phase A tool surface — what the per-function audit sub-agent is allowed to call.
+# When the orchestrator is given a `tools_image`, we additionally allow Bash invocations
+# whose first tokens are `docker run *<image>*` so the agent can drive the language's
+# static analyzers (clang static-analyzer, cppcheck, semgrep, etc.). See `_audit_allowed_tools`.
 AUDIT_AGENT_ALLOWED_TOOLS = (
     "mcp__whw__add_finding,"
     "mcp__whw__find_in_scope,"
@@ -561,6 +581,17 @@ AUDIT_AGENT_ALLOWED_TOOLS = (
     "mcp__whw__get_prior_false_positives,"
     "Read"
 )
+
+
+def _audit_allowed_tools(tools_image: str | None) -> str:
+    """Audit agent's allowed-tool list, augmented with a Bash pattern that restricts
+    shell access to `docker run *<tools_image>*` when an image is supplied. Without
+    this extension, the sub-agent prompt mentions a tools image it cannot actually use."""
+    if not tools_image:
+        return AUDIT_AGENT_ALLOWED_TOOLS
+    # claude -p's allowed-tools entries are comma-separated; the Bash pattern itself
+    # contains spaces but no commas, so the split is unambiguous.
+    return f"{AUDIT_AGENT_ALLOWED_TOOLS},Bash(docker run *{tools_image}*)"
 
 # B3.2 — re-triage sub-agent: read + 3 write tools (refute / refine / dedupe).
 TRIAGE_AGENT_ALLOWED_TOOLS = (
@@ -660,7 +691,7 @@ def _spawn_subagent_attempt(
     system_prompt = system_prompt_path.read_text(encoding="utf-8")
     cmd = _build_claude_p_cmd(
         mcp_config_path=mcp_config_path, system_prompt=system_prompt,
-        allowed_tools=AUDIT_AGENT_ALLOWED_TOOLS,
+        allowed_tools=_audit_allowed_tools(tools_image),
         model="sonnet", max_turns=s.whw_per_agent_max_turns,
     )
 

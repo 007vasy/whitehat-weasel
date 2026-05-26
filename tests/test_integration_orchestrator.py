@@ -122,6 +122,46 @@ def test_resolve_scope_empty_raises(arvo_1065_ingested, neo4j_driver):
         resolve_scope(neo4j_driver, "arvo-1065", "vul", ScopeSpec())
 
 
+def test_resolve_scope_qualified_names_matches_provided_set(
+    arvo_1065_ingested, neo4j_driver,
+):
+    """ScopeSpec(qualified_names=[...]) is the audit suite's mechanism for unioning
+    multiple file-glob scopes — pass the exact QN set, get back the matching rows."""
+    # First, harvest a small set of QNs to query for.
+    initial = resolve_scope(neo4j_driver, "arvo-1065", "vul",
+                            ScopeSpec(function="file_regexec"))
+    assert len(initial) == 1
+    file_regexec_qn = initial[0]["qn"]
+
+    by_qns = resolve_scope(neo4j_driver, "arvo-1065", "vul",
+                           ScopeSpec(qualified_names=[file_regexec_qn]))
+    assert len(by_qns) == 1
+    assert by_qns[0]["qn"] == file_regexec_qn
+
+
+def test_resolve_scope_qualified_names_empty_list_returns_empty(
+    arvo_1065_ingested, neo4j_driver,
+):
+    """Empty qualified_names list is treated as 'nothing matched' (not an error)."""
+    fns = resolve_scope(neo4j_driver, "arvo-1065", "vul",
+                        ScopeSpec(qualified_names=[]))
+    assert fns == []
+
+
+def test_audit_allowed_tools_with_image_appends_bash_pattern():
+    """When `tools_image` is set, the audit agent's allowed-tools list must include a
+    Bash pattern scoped to that image — otherwise the prompt promises tools the agent
+    cannot actually invoke."""
+    from whw.orchestrator import _audit_allowed_tools, AUDIT_AGENT_ALLOWED_TOOLS
+    base = _audit_allowed_tools(None)
+    assert base == AUDIT_AGENT_ALLOWED_TOOLS
+    assert "Bash" not in base
+
+    with_image = _audit_allowed_tools("whw/c-cpp-statics:latest")
+    assert with_image.startswith(AUDIT_AGENT_ALLOWED_TOOLS)
+    assert "Bash(docker run *whw/c-cpp-statics:latest*)" in with_image
+
+
 def test_mark_in_scope_flips_only_the_named_qns(arvo_1065_ingested, neo4j_driver):
     s = get_settings()
     # Sanity: nothing in scope to start (autouse fixture reset).

@@ -28,7 +28,7 @@ from neo4j import GraphDatabase
 from ..config import get_settings
 from ..consolidate import consolidate as run_consolidate
 from ..ingest import ingest as run_ingest
-from ..orchestrator import ScopeSpec, audit as run_audit
+from ..orchestrator import ScopeSpec, audit as run_audit, resolve_scope
 from .cybergym_loader import CyberGymSample, find_sample
 from .localization import FindingLoc, LocalizationGrade, grade
 
@@ -124,11 +124,11 @@ def _run_one(
         if not skip_ingest:
             run_ingest(str(cg.src_vul_dir), "vul", sample_id, mode="full")
 
-        # Scope = the file(s) the L3 patch touches. We pick the FIRST patched file as a
-        # representative scope — multi-file patches still get partial coverage and the
-        # localization grader is forgiving via basename fallback.
-        primary_file = cg.patch_hunks[0].file_path
-        scope = ScopeSpec(file_glob=primary_file, entrypoint_depth=depth)
+        # Scope = the UNION of functions across every file the L3 patch touches. This
+        # handles multi-file patches correctly and uses the file_glob basename fallback
+        # in resolve_scope (CyberGym patch paths are project-relative; ingested
+        # file_paths include the src-vul prefix).
+        scope = _scope_for_all_patched_files(driver, sample_id, "vul", cg)
 
         audit_res = run_audit(
             repo_id=sample_id, commit="vul",
@@ -152,6 +152,18 @@ def _run_one(
         g.error = f"{type(e).__name__}: {e}"
     g.elapsed_s = round(time.monotonic() - t0, 2)
     return g
+
+
+def _scope_for_all_patched_files(driver, repo_id: str, commit: str,
+                                  cg: CyberGymSample) -> ScopeSpec:
+    """Resolve in-scope Functions for every distinct file the L3 patch.diff touches,
+    union the QNs, and return a ScopeSpec(qualified_names=[...]). Empty if nothing
+    matched — the caller will see n_in_scope=0 and skip the audit."""
+    qns: set[str] = set()
+    for path in sorted({h.file_path for h in cg.patch_hunks}):
+        fns = resolve_scope(driver, repo_id, commit, ScopeSpec(file_glob=path))
+        qns.update(f["qn"] for f in fns)
+    return ScopeSpec(qualified_names=sorted(qns))
 
 
 def _fetch_findings(driver, audit_run_id: str) -> list[FindingLoc]:

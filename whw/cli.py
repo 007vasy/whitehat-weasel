@@ -154,12 +154,18 @@ def ingest(repo: str, commit: str, repo_id: str, mode: str, skip_index: bool) ->
 @click.option("--tools-image", help="Docker image with statics for the language.")
 @click.option("--model", default="sonnet")
 @click.option("--out", type=click.Path(), help="Write run.json summary here in addition to .whw/")
+@click.option("--consolidate", "with_consolidate", is_flag=True,
+              help="After the audit completes, chain `whw consolidate` (FP suppress + "
+                   "dedup + asset link). Matches the original spec's 'Then run "
+                   "consolidation' step. Triage + infra remain separate verbs.")
 def audit(repo_id: str, commit: str, scope_entrypoint: str | None,
           scope_function: str | None, scope_file_glob: str | None,
           scope_all: bool, depth: int,
           eval_commit: str | None, eval_commit_ts: str | None,
-          tools_image: str | None, model: str, out: str | None) -> None:
-    """Resolve scope, fan out claude -p sub-agents (serial in Phase A), write Findings."""
+          tools_image: str | None, model: str, out: str | None,
+          with_consolidate: bool) -> None:
+    """Resolve scope, fan out claude -p sub-agents (parallel + retries + sentinels in
+    Phase B), write Findings, and optionally run the Cypher consolidation passes."""
     chosen = sum(bool(x) for x in [scope_entrypoint, scope_function, scope_file_glob, scope_all])
     if chosen != 1:
         raise click.UsageError(
@@ -180,10 +186,14 @@ def audit(repo_id: str, commit: str, scope_entrypoint: str | None,
         eval_commit=eval_commit, eval_commit_ts=eval_commit_ts,
         tools_image=tools_image, model=model,
     )
-    payload = json.dumps(result.to_dict(), indent=2)
-    click.echo(payload)
+    payload = {"audit": result.to_dict()}
+    if with_consolidate:
+        cons = run_consolidate(result.audit_run_id)
+        payload["consolidate"] = cons.to_dict()
+    text = json.dumps(payload, indent=2)
+    click.echo(text)
     if out:
-        Path(out).write_text(payload)
+        Path(out).write_text(text)
 
 
 # --- consolidate -------------------------------------------------------------
