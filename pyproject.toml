@@ -23,6 +23,7 @@ dependencies = [
     "anyio>=4.4",
     # Embeddings (Phase A pluggable backend)
     "sentence-transformers>=3.0",
+    "einops>=0.7",          # required by nomic-embed-text-v1.5
     # Tooling
     "httpx>=0.27",
     "rich>=13.7",

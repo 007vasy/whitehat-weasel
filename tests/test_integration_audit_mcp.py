@@ -26,13 +26,16 @@ pytestmark = pytest.mark.integration
 
 # ----- helpers ---------------------------------------------------------------
 
-async def _call(server, name: str, **args):
+async def _call(server, tool_name: str, **args):
     """Call a registered MCP tool by name; unwrap the JSON result.
+
+    The parameter is `tool_name` (not `name`) so callers can pass tool-side `name=...`
+    arguments without colliding with this helper's signature.
 
     FastMCP returns a ToolResult with `.structured_content` (dict) and/or `.content` list.
     We prefer structured_content if present, else parse the first text content item.
     """
-    result = await server.call_tool(name, args)
+    result = await server.call_tool(tool_name, args)
     if hasattr(result, "structured_content") and result.structured_content is not None:
         sc = result.structured_content
         # When a tool returns a list, FastMCP wraps as {"result": [...]} — unwrap.

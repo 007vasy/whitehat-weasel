@@ -11,8 +11,13 @@ import os
 import shutil
 import subprocess
 
-# Must precede any `from whw...` import below.
-os.environ.setdefault("WHW_EMBEDDING_BACKEND", "noop")
+# Must precede any `from whw...` import below — Settings is a process-wide singleton
+# and locks in the embedding backend on first instantiation.
+if os.environ.get("WHW_RUN_NOMIC") == "1":
+    # User explicitly opted in to the real Nomic model — don't trample with noop.
+    os.environ.setdefault("WHW_EMBEDDING_BACKEND", "nomic")
+else:
+    os.environ.setdefault("WHW_EMBEDDING_BACKEND", "noop")
 
 from pathlib import Path
 
