@@ -269,6 +269,10 @@ def _stream_nodes(
 ) -> tuple[int, int, dict[str, int]]:
     """Iterate cbm nodes; flush per-label batches into Neo4j."""
     con = sqlite3.connect(str(db_path))
+    # cbm SQLite may contain non-UTF-8 bytes in `properties` JSON for code with
+    # exotic source-byte sequences (e.g. minified third-party JS). Replace bad
+    # bytes instead of crashing the whole ingest.
+    con.text_factory = lambda b: b.decode("utf-8", errors="replace")
     try:
         per_label: dict[str, list[dict]] = defaultdict(list)
         nodes_written = 0
@@ -361,6 +365,10 @@ def _stream_edges(
     constraint's index instead of full-graph scans.
     """
     con = sqlite3.connect(str(db_path))
+    # cbm SQLite may contain non-UTF-8 bytes in `properties` JSON for code with
+    # exotic source-byte sequences (e.g. minified third-party JS). Replace bad
+    # bytes instead of crashing the whole ingest.
+    con.text_factory = lambda b: b.decode("utf-8", errors="replace")
     try:
         # (src_label, tgt_label, type) → list of {src, tgt, confidence, source}
         buckets: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
