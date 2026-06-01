@@ -41,6 +41,8 @@ EXPECTED_TOOLS = {
     "link_finding_to_asset",
     "upsert_production_asset",
     "link_user_doc",
+    # Phase C — trust-path walk
+    "find_upstream_entrypoints",
 }
 
 

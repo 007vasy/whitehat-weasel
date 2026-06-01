@@ -398,7 +398,18 @@ def finalize_audit_run(driver: Driver, run_id: str, status: str, n_findings: int
 def fetch_callgraph_text(driver: Driver, repo_id: str, commit: str,
                          seed_qn: str, depth: int) -> str:
     """Render a tiny human-readable call-graph slice for the sub-agent prompt.
-    Falls back to Module-level USAGE/CALLS if no Function→Function edges exist."""
+
+    Contains four sections:
+      CALLERS  — direct Function→Function inbound up to `depth` hops
+      CALLEES  — direct Function→Function outbound up to `depth` hops
+      TRUST PATH — backward walk from the seed to flagged untrusted entry points
+                   (entrypoint_kind set, trust_level='UNTRUSTED', or name pattern)
+      USAGE/WRITES — sparse cbm-derived edges. Useless for taint walks but cheap
+                   to render when present and helps when name-resolution is poor.
+
+    Module-level USAGE/CALLS fallback is appended to CALLERS when no Function-level
+    inbound edges exist (cbm's C/TS parsers leave Function→Function edges sparse).
+    """
     depth = max(1, min(5, depth))
     s = get_settings()
     lines: list[str] = []
@@ -430,6 +441,44 @@ def fetch_callgraph_text(driver: Driver, repo_id: str, commit: str,
             LIMIT 20
         """, qn=seed_qn, repo_id=repo_id, commit=commit))
 
+        # TRUST PATH: backward walk to untrusted entry points. Uses the same Cypher
+        # logic as the find_upstream_entrypoints MCP tool — pre-fetched here so the
+        # agent has it in stdin without needing a separate roundtrip.
+        trust_entries = list(session.run(f"""
+            MATCH (seed:Function {{qualified_name:$qn, repo_id:$repo_id, commit:$commit}})
+            MATCH (entry:Function {{repo_id:$repo_id, commit:$commit}})
+            WHERE entry.qualified_name <> seed.qualified_name
+              AND (
+                entry.entrypoint_kind IS NOT NULL
+                OR entry.trust_level = 'UNTRUSTED'
+                OR entry.name =~ '(?i)(main|llvmfuzzertestoneinput|.*(handler|handle|route|webhook|endpoint|fuzzer|onrequest|onmessage))'
+              )
+            MATCH path = shortestPath((entry)-[:CALLS*1..{depth}]->(seed))
+            WITH entry, path, length(path) AS hops
+            RETURN entry.qualified_name AS entry_qn, entry.name AS entry_name,
+                   entry.file_path AS entry_file, entry.entrypoint_kind AS entry_kind,
+                   entry.trust_level AS trust_level, hops,
+                   [n IN nodes(path)[1..-1] | n.qualified_name] AS intermediate_qns,
+                   CASE
+                     WHEN entry.entrypoint_kind IS NOT NULL THEN 'entrypoint_kind'
+                     WHEN entry.trust_level = 'UNTRUSTED' THEN 'trust_level'
+                     ELSE 'name_pattern'
+                   END AS match_source
+            ORDER BY hops ASC, entry.qualified_name ASC
+            LIMIT 5
+        """, qn=seed_qn, repo_id=repo_id, commit=commit))
+
+        # USAGE / WRITES edges touching the seed. cbm emits these sparsely, but
+        # when present they can carry type-reference / field-write signal that
+        # the agent shouldn't have to query separately.
+        usage_writes = list(session.run("""
+            MATCH (a)-[r:USAGE|WRITES]-(seed:Function {qualified_name:$qn, repo_id:$repo_id, commit:$commit})
+            WHERE a.qualified_name <> seed.qualified_name
+            RETURN type(r) AS rel, labels(a)[0] AS kind, a.qualified_name AS qn,
+                   startNode(r).qualified_name = seed.qualified_name AS outbound
+            LIMIT 20
+        """, qn=seed_qn, repo_id=repo_id, commit=commit))
+
     lines.append("=== CALLERS (inbound) ===")
     if callers:
         for r in callers:
@@ -448,6 +497,35 @@ def fetch_callgraph_text(driver: Driver, repo_id: str, commit: str,
             lines.append(f"  hop={r['hops']} {r['name']}  @ {r['fp']}:{r['ls']}")
     else:
         lines.append("  (none — cbm's call graph may be sparse for this language)")
+
+    lines.append("")
+    lines.append("=== TRUST PATH (shortest CALLS chain from each untrusted entry to this function) ===")
+    if trust_entries:
+        for r in trust_entries:
+            kind_tag = r["entry_kind"] or r["trust_level"] or r["match_source"]
+            chain = " -> ".join(r["intermediate_qns"]) if r["intermediate_qns"] else "(direct)"
+            lines.append(
+                f"  [{kind_tag}] {r['entry_name']}  @ {r['entry_file']}  "
+                f"hops={r['hops']}  via: {chain}"
+            )
+        lines.append(
+            "  (If any of these chains lacks an authn/authz/validation check between "
+            "the entry and this function, the function inherits that untrusted reach.)"
+        )
+    else:
+        lines.append(
+            "  (no upstream entry reached within depth — function is not transitively "
+            "called by any handler/route/webhook/fuzzer-shaped function at this depth)"
+        )
+
+    lines.append("")
+    lines.append("=== USAGE / WRITES (sparse cbm edges touching this function) ===")
+    if usage_writes:
+        for r in usage_writes:
+            arrow = "->" if r["outbound"] else "<-"
+            lines.append(f"  {r['rel']} {arrow} [{r['kind']}] {r['qn']}")
+    else:
+        lines.append("  (none)")
 
     return "\n".join(lines)
 
@@ -595,6 +673,7 @@ AUDIT_AGENT_ALLOWED_TOOLS = (
     "mcp__whw__add_finding,"
     "mcp__whw__find_in_scope,"
     "mcp__whw__get_callgraph_slice,"
+    "mcp__whw__find_upstream_entrypoints,"
     "mcp__whw__get_snippet,"
     "mcp__whw__list_findings,"
     "mcp__whw__find_similar_findings,"
@@ -617,6 +696,7 @@ def _audit_allowed_tools(tools_image: str | None) -> str:
 TRIAGE_AGENT_ALLOWED_TOOLS = (
     "mcp__whw__get_snippet,"
     "mcp__whw__get_callgraph_slice,"
+    "mcp__whw__find_upstream_entrypoints,"
     "mcp__whw__find_similar_findings,"
     "mcp__whw__get_prior_false_positives,"
     "mcp__whw__list_findings,"

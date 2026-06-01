@@ -198,6 +198,26 @@ def register_read_tools(mcp: FastMCP) -> None:
         )
         return [_record_to_dict(r) for r in rows]
 
+    @mcp.tool()
+    def find_upstream_entrypoints(
+        qualified_name: Annotated[str, Field(description="QN of the target (downstream) function.")],
+        repo_id: str,
+        commit: str,
+        max_depth: Annotated[int, Field(ge=1, le=10, description="Max CALLS-edge hops to walk backward.")] = 5,
+    ) -> list[dict]:
+        """Walk CALLS backward from `qualified_name` until hitting a function that looks
+        like an untrusted entry (entrypoint_kind set, or trust_level='UNTRUSTED', or a
+        name matching a handler/route/webhook/fuzzer shape). Returns shortest path per
+        entry, ordered by hop count. Empty list means the target is not reachable from
+        any flagged entry within `max_depth` hops — that's a meaningful negative
+        signal, not an error.
+        """
+        rows = run_query(
+            render_cypher("find_upstream_entrypoints", DEPTH=max_depth),
+            {"qn": qualified_name, "repo_id": repo_id, "commit": commit},
+        )
+        return [_record_to_dict(r) for r in rows]
+
 
 def _record_to_dict(record) -> dict:
     """neo4j.Record → plain dict (no DateTime objects; they're already toString()'d in Cypher)."""
