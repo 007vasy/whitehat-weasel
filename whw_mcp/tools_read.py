@@ -16,9 +16,15 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from .db import load_cypher, render_cypher, run_one, run_query
+from .embeddings import EMBED_DIM, embed
 
 
 _VALID_DIRECTIONS = {"inbound", "outbound", "both"}
+
+
+def _is_zero_vector(v: list[float]) -> bool:
+    """A zero vector breaks cosine vector queries; short-circuit instead."""
+    return not v or all(x == 0.0 for x in v)
 
 
 def register_read_tools(mcp: FastMCP) -> None:
@@ -118,6 +124,57 @@ def register_read_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
+    def find_similar_findings(
+        summary_text: Annotated[str, Field(
+            description="The candidate finding's one-line summary. The server embeds it via "
+                        "Nomic and runs a cosine vector query against the Finding index."
+        )],
+        repo_id: str | None = None,
+        commit: str | None = None,
+        k: Annotated[int, Field(ge=1, le=50)] = 10,
+        min_cosine: Annotated[float, Field(ge=-1.0, le=1.0)] = 0.85,
+        eval_commit_ts: Annotated[str | None, Field(
+            description="ISO-8601; if set, prior findings observed at/after this ts are hidden."
+        )] = None,
+    ) -> list[dict]:
+        """Vector-search Findings semantically similar to `summary_text`. Returns top-`k`
+        rows above `min_cosine`. Used by the audit sub-agent to spot prior duplicates
+        before filing, and by the consolidation pipeline for dedup grouping.
+        """
+        v = embed(summary_text)
+        if _is_zero_vector(v):
+            return []
+        rows = run_query(load_cypher("find_similar_findings"), {
+            "embedding": v, "k": k, "min_cosine": min_cosine,
+            "repo_id": repo_id, "commit": commit, "eval_ts": eval_commit_ts,
+        })
+        return [_record_to_dict(r) for r in rows]
+
+    @mcp.tool()
+    def get_prior_false_positives(
+        summary_text: Annotated[str, Field(
+            description="One-line summary of the agent's working hypothesis."
+        )],
+        repo_id: str | None = None,
+        commit: str | None = None,
+        k: Annotated[int, Field(ge=1, le=50)] = 10,
+        min_cosine: Annotated[float, Field(ge=-1.0, le=1.0)] = 0.88,
+        eval_commit_ts: str | None = None,
+    ) -> list[dict]:
+        """Vector-search prior :FalsePositive nodes. If any match at high cosine, the
+        agent should DROP the hypothesis. Threshold defaults stricter (0.88) than
+        find_similar_findings since FP suppression is high-impact.
+        """
+        v = embed(summary_text)
+        if _is_zero_vector(v):
+            return []
+        rows = run_query(load_cypher("get_prior_false_positives"), {
+            "embedding": v, "k": k, "min_cosine": min_cosine,
+            "repo_id": repo_id, "commit": commit, "eval_ts": eval_commit_ts,
+        })
+        return [_record_to_dict(r) for r in rows]
+
+    @mcp.tool()
     def list_findings(
         repo_id: str,
         commit: str,
@@ -138,6 +195,26 @@ def register_read_tools(mcp: FastMCP) -> None:
                 "eval_ts": eval_commit_ts,
                 "limit": limit,
             },
+        )
+        return [_record_to_dict(r) for r in rows]
+
+    @mcp.tool()
+    def find_upstream_entrypoints(
+        qualified_name: Annotated[str, Field(description="QN of the target (downstream) function.")],
+        repo_id: str,
+        commit: str,
+        max_depth: Annotated[int, Field(ge=1, le=10, description="Max CALLS-edge hops to walk backward.")] = 5,
+    ) -> list[dict]:
+        """Walk CALLS backward from `qualified_name` until hitting a function that looks
+        like an untrusted entry (entrypoint_kind set, or trust_level='UNTRUSTED', or a
+        name matching a handler/route/webhook/fuzzer shape). Returns shortest path per
+        entry, ordered by hop count. Empty list means the target is not reachable from
+        any flagged entry within `max_depth` hops — that's a meaningful negative
+        signal, not an error.
+        """
+        rows = run_query(
+            render_cypher("find_upstream_entrypoints", DEPTH=max_depth),
+            {"qn": qualified_name, "repo_id": repo_id, "commit": commit},
         )
         return [_record_to_dict(r) for r in rows]
 

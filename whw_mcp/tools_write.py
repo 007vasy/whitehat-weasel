@@ -7,6 +7,7 @@ statement so re-invocations are idempotent or auditable.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Annotated, Any
 
@@ -17,10 +18,19 @@ from .db import load_cypher, run_one
 from .embeddings import EMBED_DIM, embed
 
 
+def _deterministic_asset_id(name: str, kind: str) -> str:
+    """Stable id from (name, kind) so re-extraction hits the same row."""
+    h = hashlib.sha256(f"{name}\x00{kind}".encode("utf-8")).hexdigest()
+    return f"asset-{h[:24]}"
+
+
 SEVERITY_VOCAB = {"info", "low", "med", "high", "crit"}
 CONFIDENCE_VOCAB = {"certain", "inferred", "uncertain"}
 SOURCE_VOCAB = {"llm", "manual", "docstring", "infra-pass"}
 MODE_VOCAB = {"live", "eval"}
+ASSET_KIND_VOCAB = {"db", "cache", "queue", "secret", "endpoint", "container",
+                    "iam", "bucket", "network", "observability", "third_party"}
+CRITICALITY_VOCAB = {"low", "med", "high", "crit"}
 
 
 def register_write_tools(mcp: FastMCP) -> None:
@@ -173,3 +183,108 @@ def register_write_tools(mcp: FastMCP) -> None:
                 f"{function_qn!r} not present for the run's (repo_id, commit)."
             )
         return dict(row)
+
+    @mcp.tool()
+    def mark_false_positive(
+        finding_id: str,
+        reason: Annotated[str, Field(min_length=1, description="Why this is a false positive.")],
+        marked_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Flip a Finding's status to 'fp' AND create a sibling :FalsePositive node
+        carrying the Finding's embedding so future audits can vector-suppress repeats."""
+        if not finding_id.strip():
+            raise ValueError("finding_id must be non-empty")
+        fp_id = str(uuid.uuid4())
+        row = run_one(load_cypher("mark_false_positive"), {
+            "finding_id": finding_id, "fp_id": fp_id,
+            "reason": reason, "marked_by": marked_by,
+        })
+        if row is None:
+            raise RuntimeError(f"mark_false_positive: Finding {finding_id!r} not found")
+        return dict(row)
+
+    @mcp.tool()
+    def link_finding_duplicate(
+        duplicate_id: Annotated[str, Field(description="The Finding being marked as a duplicate.")],
+        canonical_id: Annotated[str, Field(description="The Finding it duplicates of.")],
+        cosine: Annotated[float, Field(ge=-1.0, le=1.0)] = 1.0,
+    ) -> dict[str, Any]:
+        """Create `(duplicate)-[:DUPLICATE_OF]->(canonical)` + a SIMILAR_TO edge carrying
+        the measured cosine. Flips the duplicate's status to 'duplicate' so subsequent
+        consolidation passes ignore it."""
+        if duplicate_id == canonical_id:
+            raise ValueError("duplicate_id and canonical_id must differ")
+        row = run_one(load_cypher("link_finding_duplicate"), {
+            "a_id": duplicate_id, "canonical_id": canonical_id, "cosine": cosine,
+        })
+        if row is None:
+            raise RuntimeError(
+                f"link_finding_duplicate: one of {duplicate_id!r}/{canonical_id!r} not found"
+            )
+        return dict(row)
+
+    @mcp.tool()
+    def link_finding_to_asset(
+        finding_id: str,
+        asset_id: str,
+    ) -> dict[str, Any]:
+        """Idempotent :AFFECTS_ASSET edge between a Finding and a ProductionAsset."""
+        row = run_one(load_cypher("link_finding_to_asset"), {
+            "finding_id": finding_id, "asset_id": asset_id,
+        })
+        if row is None:
+            raise RuntimeError(
+                f"link_finding_to_asset: Finding {finding_id!r} or Asset {asset_id!r} not found"
+            )
+        return dict(row)
+
+    @mcp.tool()
+    def upsert_production_asset(
+        name: Annotated[str, Field(min_length=1, max_length=200)],
+        kind: Annotated[str, Field(description=f"One of: {sorted(ASSET_KIND_VOCAB)}")],
+        description: Annotated[str, Field(default="", description="One sentence.")] = "",
+        criticality: Annotated[str, Field(description="low|med|high|crit")] = "med",
+        id: str | None = None,
+    ) -> dict[str, Any]:
+        """Upsert a :ProductionAsset. Server computes:
+          - id (deterministic from sha256(name||kind) if not supplied),
+          - embedding (Nomic of `name + ' ' + description`).
+
+        Re-calls with the same name+kind upsert the same node — safe for the infra-pass
+        agent to call repeatedly during extraction.
+        """
+        if kind not in ASSET_KIND_VOCAB:
+            raise ValueError(f"kind must be one of {sorted(ASSET_KIND_VOCAB)}")
+        if criticality not in CRITICALITY_VOCAB:
+            raise ValueError(f"criticality must be one of {sorted(CRITICALITY_VOCAB)}")
+        asset_id = id or _deterministic_asset_id(name, kind)
+        emb = embed(f"{name} {description}".strip())
+        if len(emb) != EMBED_DIM:
+            raise RuntimeError(f"embedding dim {len(emb)} != {EMBED_DIM}")
+        row = run_one(load_cypher("upsert_production_asset"), {
+            "id": asset_id, "name": name, "kind": kind,
+            "description": description, "criticality": criticality, "embedding": emb,
+        })
+        return dict(row) if row else {"id": asset_id, "name": name, "kind": kind}
+
+    @mcp.tool()
+    def link_user_doc(
+        path: str,
+        audit_run_id: str,
+        sha256: str,
+        content_text: Annotated[str, Field(description="Chunk text; embedded server-side.")],
+        mentions: Annotated[list[str] | None, Field(
+            description="Asset ids this chunk mentions; each gets a :MENTIONS edge."
+        )] = None,
+    ) -> dict[str, Any]:
+        """Register a chunk of the user-context bundle for this run and link it to
+        ProductionAssets it mentions. The :MENTIONS edges let the consolidation infra
+        pass tie code-level Findings to operational assets via cosine matching."""
+        emb = embed(content_text)
+        if len(emb) != EMBED_DIM:
+            raise RuntimeError(f"embedding dim {len(emb)} != {EMBED_DIM}")
+        row = run_one(load_cypher("link_user_doc"), {
+            "path": path, "audit_run_id": audit_run_id, "sha256": sha256,
+            "embedding": emb, "mentions": mentions or [],
+        })
+        return dict(row) if row else {"path": path, "audit_run_id": audit_run_id, "mention_count": 0}

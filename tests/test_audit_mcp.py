@@ -24,6 +24,7 @@ from whw_mcp.server import build_server
 
 
 EXPECTED_TOOLS = {
+    # Phase A
     "find_in_scope",
     "get_callgraph_slice",
     "get_snippet",
@@ -32,17 +33,27 @@ EXPECTED_TOOLS = {
     "mark_in_scope",
     "record_audit_run",
     "add_finding",
+    # Phase B
+    "find_similar_findings",
+    "get_prior_false_positives",
+    "mark_false_positive",
+    "link_finding_duplicate",
+    "link_finding_to_asset",
+    "upsert_production_asset",
+    "link_user_doc",
+    # Phase C — trust-path walk
+    "find_upstream_entrypoints",
 }
 
 
 @pytest.mark.asyncio
-async def test_server_builds_and_registers_all_phase_a_tools():
+async def test_server_builds_and_registers_full_tool_surface():
+    """Asserts the audit MCP exposes exactly the Phase A + Phase B tool set (no more, no less)."""
     mcp = build_server()
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     missing = EXPECTED_TOOLS - names
     assert not missing, f"missing tools: {sorted(missing)}; got {sorted(names)}"
-    # No extras either — the Phase A surface is locked.
     extras = names - EXPECTED_TOOLS
     assert not extras, f"unexpected extra tools: {sorted(extras)}"
 
