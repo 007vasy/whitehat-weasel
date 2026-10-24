@@ -16,7 +16,7 @@ services:
       # HTTP browser intentionally NOT exposed by default (host has 7474-7476 already
       # bound by other Neo4j instances). Uncomment + pick a free high port if needed:
       # - "17474:7474"
-      - "7691:7687"   # Bolt — the only port we need for the audit MCP & ingest.
+      - "127.0.0.1:7691:7687"   # Bolt — the only port we need for the audit MCP & ingest.
     environment:
       NEO4J_AUTH: neo4j/whw-dev-password
       NEO4J_dbms_memory_heap_initial__size: 1G
